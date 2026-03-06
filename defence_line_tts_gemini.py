@@ -12,6 +12,7 @@ from pydub import AudioSegment
 from google import genai
 from google.genai import types
 from bs4 import BeautifulSoup
+import subprocess
 
 # === ЗАВАНТАЖЕННЯ API КЛЮЧА ===
 _config_path = os.path.expanduser("~/.local/dl-audio.conf")
@@ -38,7 +39,9 @@ OUTPUT_DIR = "defence_line_audio_gemini"
 MODEL = "gemini-2.5-flash-preview-tts"
 VOICE = "Algenib"
 # Максимальна кількість нових статей для обробки за один запуск
-MAX_ARTICLES = 5
+MAX_ARTICLES = 10
+# Cover image to use for MP4 video files (will be downloaded and cached locally)
+COVER_URL = "https://secure.gravatar.com/avatar/ffcf95b5d4014948e6c4fc277554c5d715be737b67af02854e55f3970bff90f6?s=300&d=mm&r=g"
 
 # Ініціалізація клієнта Gemini
 client = genai.Client(api_key=API_KEY)
@@ -117,6 +120,17 @@ def download_and_tts():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
         print(f"[INFO] Створено папку: {OUTPUT_DIR}")
+    # Download cover image once and reuse
+    cover_path = os.path.join(OUTPUT_DIR, "cover.jpg")
+    if not os.path.exists(cover_path):
+        try:
+            r = requests.get(COVER_URL, timeout=20)
+            r.raise_for_status()
+            with open(cover_path, "wb") as _cf:
+                _cf.write(r.content)
+            print(f"[INFO] Завантажено обкладинку: {cover_path}")
+        except Exception as e:
+            print(f"[WARN] Не вдалося завантажити обкладинку: {e}")
     # Завантажуємо індекс оброблених статей
     processed_db_path = os.path.join(OUTPUT_DIR, "processed.json")
     if os.path.exists(processed_db_path):
@@ -213,8 +227,44 @@ def download_and_tts():
                 channels=1,
             ).export(filepath, format="mp3", bitrate="64k")
             print(f"[SUCCESS] Збережено: {filename}")
-            # Додаємо запис до індексу оброблених статей
-            processed[entry_id] = filename
+            # Create MP4 video with cover image and embed metadata comment (link + published time)
+            try:
+                base_name = os.path.splitext(filename)[0]
+                mp4_filename = f"{base_name}.mp4"
+                mp4_path = os.path.join(OUTPUT_DIR, mp4_filename)
+                article_link = entry.get('link') if 'link' in entry else ''
+                published_display = entry.get('published') if 'published' in entry else pubdate_prefix
+                comment_meta = f"Link: {article_link} | Published: {published_display}"
+                # ffmpeg command: static image + audio -> mp4
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-loop", "1",
+                    "-i", cover_path,
+                    "-i", filepath,
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    "-shortest",
+                    "-movflags", "+faststart",
+                    "-metadata", f"comment={comment_meta}",
+                    mp4_path,
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print(f"[SUCCESS] Створено MP4: {mp4_filename}")
+                # update processed index to mp4 filename
+                processed[entry_id] = mp4_filename
+                # Optionally remove the intermediate mp3
+                try:
+                    os.remove(filepath)
+                except Exception:
+                    pass
+            except FileNotFoundError:
+                print("[WARN] ffmpeg не знайдено — пропущено створення MP4. Залишено MP3.")
+                processed[entry_id] = filename
+            except subprocess.CalledProcessError as e:
+                print(f"[WARN] Помилка ffmpeg при створенні MP4: {e}")
+                processed[entry_id] = filename
             try:
                 with open(processed_db_path, "w", encoding="utf-8") as _f:
                     json.dump(processed, _f, ensure_ascii=False, indent=2)
@@ -318,7 +368,51 @@ if __name__ == "__main__":
                     channels=1,
                 ).export(filepath, format="mp3", bitrate="64k")
                 print(f"[SUCCESS] Збережено: {filename}")
-                processed[entry_id] = filename
+                # Create MP4 with cover and metadata
+                try:
+                    cover_path = os.path.join(OUTPUT_DIR, "cover.jpg")
+                    if not os.path.exists(cover_path):
+                        try:
+                            r = requests.get(COVER_URL, timeout=20)
+                            r.raise_for_status()
+                            with open(cover_path, "wb") as _cf:
+                                _cf.write(r.content)
+                            print(f"[INFO] Завантажено обкладинку: {cover_path}")
+                        except Exception as e:
+                            print(f"[WARN] Не вдалося завантажити обкладинку: {e}")
+                    base_name = os.path.splitext(filename)[0]
+                    mp4_filename = f"{base_name}.mp4"
+                    mp4_path = os.path.join(OUTPUT_DIR, mp4_filename)
+                    article_link = url
+                    published_display = format_pubdate_from_soup(soup)
+                    comment_meta = f"Link: {article_link} | Published: {published_display}"
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-loop", "1",
+                        "-i", cover_path,
+                        "-i", filepath,
+                        "-c:v", "libx264",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        "-shortest",
+                        "-movflags", "+faststart",
+                        "-metadata", f"comment={comment_meta}",
+                        mp4_path,
+                    ]
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    print(f"[SUCCESS] Створено MP4: {mp4_filename}")
+                    processed[entry_id] = mp4_filename
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                except FileNotFoundError:
+                    print("[WARN] ffmpeg не знайдено — пропущено створення MP4. Залишено MP3.")
+                    processed[entry_id] = filename
+                except subprocess.CalledProcessError as e:
+                    print(f"[WARN] Помилка ffmpeg при створенні MP4: {e}")
+                    processed[entry_id] = filename
                 try:
                     with open(processed_db_path, "w", encoding="utf-8") as _f:
                         json.dump(processed, _f, ensure_ascii=False, indent=2)
